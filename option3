@@ -1,0 +1,260 @@
+Terraform Module — GCP Dataproc Serverless for Apache Spark (Reusable)
+
+This module sets up opinionated reusable infrastructure for Google Cloud Dataproc Serverless for Apache Spark and (optionally) submits batches.
+
+It is designed so that you can:
+
+Enable required APIs
+
+Create or reuse a service account with least‑privilege bindings you control
+
+Optionally create a staging GCS bucket
+
+Provide one or more batch job definitions as input (map/object)
+
+Do not submit jobs by default (so Terraform stays idempotent)
+
+Optionally submit batches on apply via a safe toggle for dev/test
+
+Generate ready‑to‑run gcloud commands and REST JSON payloads for CI/CD or schedulers
+
+⚠️ Why not always create google_dataproc_batch resources? Submitting a batch is an action, not persistent state. Creating batches in Terraform can cause re‑submissions on changes. This module keeps job submission optional (toggle) and focuses on reusable, composable infra + job specs.
+
+Files
+
+main.tf — resources (APIs, SA, bucket, optional batch submission)
+
+variables.tf — inputs
+
+outputs.tf — outputs (emails, bucket, commands, JSON payloads)
+
+examples/simple/ — minimal example (no job submission)
+
+examples/with-submit/ — example that submits on apply (dev only)
+
+main.tf
+    }
+            ])) : null
+          )
+        )
+      )
+      rest_payload = jsonencode({
+        batchId = k
+        environmentConfig = {
+          stagingBucket   = local.staging_bucket
+          peripheralsConfig = { metastoreService = var.metastore_service }
+          executionConfig = {
+            serviceAccount = local.sa_email
+            subnetworkUri  = var.subnetwork_self_link
+            kmsKey         = lookup(v, "kms_key", null)
+            networkTags    = lookup(v, "network_tags", [])
+          }
+        }
+        labels = merge(var.labels, lookup(v, "labels", {}))
+        runtimeConfig = {
+          version    = lookup(v, "runtime_version", var.default_runtime_version)
+          properties = lookup(v, "properties", {})
+        }
+        (v.runtime == "pyspark" ? {
+          pysparkBatch = {
+            mainPythonFileUri = lookup(v, "main_python_file_uri", null)
+            args              = lookup(v, "args", [])
+            pythonFileUris    = lookup(v, "python_file_uris", [])
+            jarFileUris       = lookup(v, "jar_file_uris", [])
+            fileUris          = lookup(v, "file_uris", [])
+            archiveUris       = lookup(v, "archive_uris", [])
+          }
+        } : (v.runtime == "spark" ? {
+          sparkBatch = {
+            mainClass       = lookup(v, "main_class", null)
+            mainJarFileUri  = lookup(v, "main_jar_file_uri", null)
+            args            = lookup(v, "args", [])
+            jarFileUris     = lookup(v, "jar_file_uris", [])
+            fileUris        = lookup(v, "file_uris", [])
+            archiveUris     = lookup(v, "archive_uris", [])
+          }
+        } : (v.runtime == "sparkr" ? {
+          sparkRBatch = {
+            mainRFileUri = lookup(v, "main_r_file_uri", null)
+            args         = lookup(v, "args", [])
+            fileUris     = lookup(v, "file_uris", [])
+            archiveUris  = lookup(v, "archive_uris", [])
+            jarFileUris  = lookup(v, "jar_file_uris", [])
+          }
+        } : (v.runtime == "spark_sql" ? {
+          sparkSqlBatch = {
+            queryFileUri  = lookup(v, "query_file_uri", null)
+            queryVariables = lookup(v, "query_variables", {})
+          }
+        } : {}))))
+      }
+    }
+  }
+}
+variables.tf
+variable "project_id" {
+  runtime_version      = "2.2"
+  properties           = { "spark.executor.instances" = "2" }
+  labels               = { team = "de" }
+  kms_key              = null
+  network_tags         = []
+
+
+  # pyspark
+  main_python_file_uri = "gs://bucket/jobs/job.py"
+  python_file_uris     = ["gs://bucket/jobs/lib.zip"]
+  jar_file_uris        = ["gs://bucket/jars/extra.jar"]
+  file_uris            = []
+  archive_uris         = []
+  args                 = ["--foo","bar"]
+
+
+  # spark (Scala/Java)
+  main_class           = null
+  main_jar_file_uri    = null
+
+
+  # sparkR
+  main_r_file_uri      = null
+
+
+  # spark-sql
+  query_file_uri       = null
+  query_variables      = {}
+}
+EOT
+  type = map(object({
+    runtime         = string
+    runtime_version = optional(string)
+    properties      = optional(map(string), {})
+    labels          = optional(map(string), {})
+    kms_key         = optional(string)
+    network_tags    = optional(list(string), [])
+
+
+    # pyspark
+    main_python_file_uri = optional(string)
+    python_file_uris     = optional(list(string), [])
+    jar_file_uris        = optional(list(string), [])
+    file_uris            = optional(list(string), [])
+    archive_uris         = optional(list(string), [])
+    args                 = optional(list(string), [])
+
+
+    # spark (Scala/Java)
+    main_class        = optional(string)
+    main_jar_file_uri = optional(string)
+
+
+    # sparkR
+    main_r_file_uri = optional(string)
+
+
+    # spark-sql
+    query_file_uri   = optional(string)
+    query_variables  = optional(map(string), {})
+  }))
+  default = {}
+}
+outputs.tf
+output "service_account_email" {
+  value       = local.sa_email
+  description = "Email of the service account used by batches"
+}
+
+
+output "staging_bucket" {
+  value       = local.staging_bucket
+  description = "Staging bucket used by Dataproc Serverless"
+}
+
+
+output "gcloud_commands" {
+  description = "Rendered gcloud commands per batch (do not blindly run in prod)"
+  value       = { for k, v in local.rendered_batches : k => v.gcloud }
+}
+
+
+output "rest_payloads" {
+  description = "Rendered REST JSON payloads per batch for API submission"
+  value       = { for k, v in local.rendered_batches : k => v.rest_payload }
+  sensitive   = false
+}
+Example: Minimal (no submission)
+
+examples/simple/main.tf
+
+module "spark" {
+  source  = "../.."
+
+
+  project_id = var.project_id
+  region     = var.region
+
+
+  labels = { env = "dev", owner = "data" }
+
+
+  # Define job specs but do NOT submit via Terraform
+  submit_on_apply = false
+  spark_batches = {
+    daily_pyspark = {
+      runtime              = "pyspark"
+      runtime_version      = "2.2"
+      main_python_file_uri = "gs://my-bucket/jobs/job.py"
+      python_file_uris     = ["gs://my-bucket/jobs/libs.zip"]
+      properties           = { "spark.executor.instances" = "2" }
+      args                 = ["--date", "${formatdate("YYYY-MM-DD", timestamp())}"]
+    }
+  }
+}
+Example: Submit on apply (dev/test only)
+
+examples/with-submit/main.tf
+
+module "spark" {
+  source  = "../.."
+
+
+  project_id = var.project_id
+  region     = var.region
+
+
+  create_service_account = true
+  service_account_project_roles = [
+    "roles/dataproc.editor",
+    "roles/storage.objectAdmin",
+    "roles/bigquery.user"
+  ]
+
+
+  create_staging_bucket = true
+  staging_bucket_name   = "${var.project_id}-spark-staging"
+
+
+  submit_on_apply = true
+  spark_batches = {
+    adhoctest = {
+      runtime              = "pyspark"
+      runtime_version      = "2.2"
+      main_python_file_uri = "gs://my-bucket/jobs/test.py"
+      args                 = ["--limit","100"]
+      properties           = { "spark.executor.instances" = "2" }
+    }
+  }
+}
+Tips & Notes
+
+Idempotency: Prefer using the generated gcloud commands or REST payloads from outputs to submit from CI/CD or schedulers (Cloud Run, Cloud Workflows, Cloud Scheduler + HTTPS). Keep Terraform for infra/state.
+
+Networking: Set subnetwork_self_link to run batches with private egress; add network_tags + firewall rules as needed.
+
+Metastore: If you use Dataproc Metastore, pass its full service name into metastore_service.
+
+Runtime versions: Check supported Dataproc Serverless runtime versions and Spark properties before choosing default_runtime_version.
+
+Least privilege: Start with minimal roles and add only what your workload requires. Some orgs prefer custom roles over broad editor‑like roles.
+
+Make it yours
+
+If you want, I can tailor this to your exact env (private networks, CMEK on everything, Artifact Registry for custom images, Workbench‑style secrets, Cloud Run/Workflows scheduler, etc.). Just drop your constraints and I’ll wire them in.
