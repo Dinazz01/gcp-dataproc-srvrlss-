@@ -1,0 +1,332 @@
+Module files
+main.tf
+terraform {
+  required_version = ">= 1.5.0"
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = ">= 5.26.0"
+    }
+  }
+}
+
+locals {
+  use_pyspark = lower(var.batch_type) == "pyspark"
+  use_spark   = lower(var.batch_type) == "spark"
+}
+
+# Optional staging bucket for job artifacts & logs
+resource "google_storage_bucket" "staging" {
+  count         = var.create_staging_bucket ? 1 : 0
+  name          = var.staging_bucket_name
+  location      = var.region
+  force_destroy = var.staging_bucket_force_destroy
+
+  uniform_bucket_level_access = true
+
+  lifecycle_rule {
+    action { type = "Delete" }
+    condition {
+      age            = var.staging_bucket_object_ttl_days
+      with_state     = "ANY"
+    }
+  }
+
+  labels = merge(var.labels, { purpose = "dataproc-serverless-staging" })
+}
+
+# Dataproc Serverless Batch
+resource "google_dataproc_batch" "this" {
+  project  = var.project_id
+  location = var.region
+  batch_id = var.batch_id
+
+  # Exactly one of pyspark_batch or spark_batch must be set
+  dynamic "pyspark_batch" {
+    for_each = local.use_pyspark ? [1] : []
+    content {
+      main_python_file_uri = var.main_python_file_uri
+      args                 = var.args
+
+      jar_file_uris   = var.jar_file_uris
+      file_uris       = var.file_uris
+      archive_uris    = var.archive_uris
+      python_file_uris = var.python_file_uris
+    }
+  }
+
+  dynamic "spark_batch" {
+    for_each = local.use_spark ? [1] : []
+    content {
+      main_class       = var.main_class
+      main_jar_file_uri = var.main_jar_file_uri
+      args              = var.args
+
+      jar_file_uris = var.jar_file_uris
+      file_uris     = var.file_uris
+      archive_uris  = var.archive_uris
+    }
+  }
+
+  # Runtime tuning
+  runtime_config {
+    version         = var.runtime_version         # e.g. "2.1"
+    container_image = var.container_image         # optional custom image
+    properties      = var.spark_properties        # spark.* / hive.* etc.
+  }
+
+  environment_config {
+    execution_config {
+      service_account            = var.service_account_email
+      subnetwork_uri             = var.subnetwork_uri
+      network_tags               = var.network_tags
+      kms_key                    = var.kms_key
+      staging_bucket             = coalesce(var.staging_bucket, try(google_storage_bucket.staging[0].name, null))
+      idle_ttl                   = var.idle_ttl
+      network_uri                = var.network_uri
+    }
+
+    # Optional Dataproc Metastore (for Hive/Spark SQL catalogs)
+    dynamic "peripherals_config" {
+      for_each = var.metastore_service != null ? [1] : []
+      content {
+        metastore_service = var.metastore_service
+      }
+    }
+
+    # Environment variables (passed to containers)
+    dynamic "spark_history_server_config" {
+      # not required; use if you run an external history server
+      for_each = []
+      content {}
+    }
+
+    # Exported env vars
+    dynamic "spark_submit_environment" {
+      for_each = length(var.env) > 0 ? [1] : []
+      content {
+        properties = var.env
+      }
+    }
+  }
+
+  labels = var.labels
+}
+
+# Optional IAM bindings for the service account (minimal helpful defaults)
+resource "google_project_iam_member" "dataproc_worker" {
+  count   = var.grant_sa_roles ? 1 : 0
+  project = var.project_id
+  role    = "roles/dataproc.worker"
+  member  = "serviceAccount:${var.service_account_email}"
+}
+
+resource "google_project_iam_member" "storage_object_admin" {
+  count   = var.grant_sa_roles ? 1 : 0
+  project = var.project_id
+  role    = "roles/storage.objectAdmin"
+  member  = "serviceAccount:${var.service_account_email}"
+}
+
+# Optional: allow SA to use KMS key for staging bucket encryption, if provided
+resource "google_kms_crypto_key_iam_member" "kms_sa_user" {
+  count         = var.grant_sa_roles && var.kms_key != null ? 1 : 0
+  crypto_key_id = var.kms_key
+  role          = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
+  member        = "serviceAccount:${var.service_account_email}"
+}
+
+variables.tf
+variable "project_id"            { type = string }
+variable "region"                { type = string }
+variable "batch_id"              { type = string } # must be unique per location
+
+variable "batch_type" {
+  description = "spark or pyspark"
+  type        = string
+  default     = "pyspark"
+  validation {
+    condition     = contains(["spark","pyspark"], lower(var.batch_type))
+    error_message = "batch_type must be 'spark' or 'pyspark'."
+  }
+}
+
+# PySpark inputs
+variable "main_python_file_uri" {
+  type        = string
+  default     = null
+  description = "gs://.../main.py (required for pyspark)"
+}
+
+variable "python_file_uris" {
+  type        = list(string)
+  default     = []
+}
+
+# Spark (Scala/Java) inputs
+variable "main_class" {
+  type        = string
+  default     = null
+  description = "com.example.Main (required for spark)"
+}
+variable "main_jar_file_uri" {
+  type        = string
+  default     = null
+  description = "gs://.../app.jar (required if main_class used and JAR not on image)"
+}
+
+# Common job inputs
+variable "args"            { type = list(string)  default = [] }
+variable "jar_file_uris"   { type = list(string)  default = [] }
+variable "file_uris"       { type = list(string)  default = [] }
+variable "archive_uris"    { type = list(string)  default = [] }
+
+# Runtime / environment
+variable "runtime_version" { type = string default = "2.1" } # Dataproc Serverless runtime version
+variable "container_image" { type = string default = null }  # Optional custom image
+variable "spark_properties" {
+  type        = map(string)
+  default     = {}
+  description = "Spark/Hadoop properties (e.g., spark.executor.instances, spark.sql.*)"
+}
+variable "env" {
+  type        = map(string)
+  default     = {}
+  description = "Environment variables exposed to the job runtime"
+}
+
+# Networking & security
+variable "service_account_email" { type = string }
+variable "network_uri"           { type = string default = null }
+variable "subnetwork_uri"        { type = string default = null }
+variable "network_tags"          { type = list(string) default = [] }
+variable "kms_key"               { type = string default = null }
+variable "idle_ttl"              { type = string default = null } # e.g., "3600s"
+
+# Staging bucket options
+variable "staging_bucket" { type = string default = null }
+
+variable "create_staging_bucket" {
+  type    = bool
+  default = false
+}
+
+variable "staging_bucket_name" {
+  type        = string
+  default     = null
+  description = "Required if create_staging_bucket = true"
+}
+
+variable "staging_bucket_force_destroy" { type = bool default = false }
+variable "staging_bucket_object_ttl_days" { type = number default = 7 }
+
+# Dataproc Metastore (optional)
+variable "metastore_service" {
+  type        = string
+  default     = null
+  description = "projects/<proj>/locations/<region>/services/<name>"
+}
+
+# IAM conveniences
+variable "grant_sa_roles" {
+  type        = bool
+  default     = true
+  description = "Grant roles/dataproc.worker and roles/storage.objectAdmin to the service account"
+}
+
+variable "labels" {
+  type    = map(string)
+  default = {}
+}
+
+outputs.tf
+output "batch_name" {
+  value       = google_dataproc_batch.this.name
+  description = "Full resource name of the Dataproc Serverless batch."
+}
+
+output "state" {
+  value       = google_dataproc_batch.this.state
+  description = "Batch state (e.g., PENDING, RUNNING, SUCCEEDED, FAILED)."
+}
+
+output "state_message" {
+  value       = try(google_dataproc_batch.this.state_message, null)
+  description = "Additional state details, if any."
+}
+
+output "staging_bucket" {
+  value       = coalesce(var.staging_bucket, try(google_storage_bucket.staging[0].name, null))
+  description = "Effective staging bucket used by the batch."
+}
+
+Example usage
+PySpark job
+provider "google" {
+  project = "my-gcp-project"
+  region  = "us-central1"
+}
+
+module "spark_batch" {
+  source  = "./modules/dataproc_serverless_spark"
+
+  project_id = "my-gcp-project"
+  region     = "us-central1"
+  batch_id   = "daily-sales-etl-001"
+
+  batch_type           = "pyspark"
+  main_python_file_uri = "gs://my-artifacts/jobs/daily_sales_etl/main.py"
+  args                 = ["--date", "2025-10-30"]
+
+  # Optional dependencies
+  python_file_uris = [
+    "gs://my-artifacts/jobs/libs/util.py"
+  ]
+  jar_file_uris = [
+    "gs://my-artifacts/jars/spark-avro_2.12-3.5.1.jar"
+  ]
+
+  runtime_version  = "2.1"
+  spark_properties = {
+    "spark.executor.instances" = "4"
+    "spark.executor.memory"    = "4g"
+    "spark.dataproc.sql.warehouse.provider" = "BIGQUERY"
+  }
+
+  env = {
+    APP_ENV = "prod"
+  }
+
+  # Networking & security
+  service_account_email = "spark-runner@my-gcp-project.iam.gserviceaccount.com"
+  subnetwork_uri        = "projects/my-gcp-project/regions/us-central1/subnetworks/data-subnet"
+  kms_key               = "projects/my-gcp-project/locations/us-central1/keyRings/app/cryptoKeys/dataproc-staging"
+  metastore_service     = "projects/my-gcp-project/locations/us-central1/services/hive-ms"
+
+  # Staging bucket (create or reuse)
+  create_staging_bucket           = true
+  staging_bucket_name             = "my-gcp-project-dp-staging"
+  staging_bucket_object_ttl_days  = 3
+
+  labels = {
+    app = "sales-etl"
+    env = "prod"
+  }
+}
+
+Spark (Scala/Java) job
+module "spark_scala_batch" {
+  source    = "./modules/dataproc_serverless_spark"
+  project_id = "my-gcp-project"
+  region     = "us-central1"
+  batch_id   = "ad-hoc-spark-jar-01"
+
+  batch_type        = "spark"
+  main_class        = "com.example.analytics.Main"
+  main_jar_file_uri = "gs://my-artifacts/jars/analytics-app-1.0.0.jar"
+
+  args = ["--limit", "1000"]
+
+  service_account_email = "spark-runner@my-gcp-project.iam.gserviceaccount.com"
+  staging_bucket        = "my-gcp-project-dp-staging" # reuse existing
+}
